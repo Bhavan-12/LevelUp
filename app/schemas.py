@@ -183,6 +183,7 @@ class AnalyticsSummary(BaseModel):
     total_xp: int
     level: int
 
+
 class LeaderboardEntry(BaseModel):
     rank: int
     user_id: int
