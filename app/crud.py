@@ -137,3 +137,70 @@ def update_user_streaks(conn, user_id: int):
 
     cursor.execute("UPDATE users SET current_streak = ?, longest_streak = ? WHERE id = ?", (current_streak, longest_streak, user_id))
 
+def create_user(conn, username: str, email: str, hashed_password: str, bio: str = "", avatar_url: str = "avatar-1") -> dict:
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO users (username, email, hashed_password, bio, avatar_url)
+        VALUES (?, ?, ?, ?, ?)
+    """, (username, email, hashed_password, bio, avatar_url))
+    user_id = cursor.lastrowid
+    log_activity(conn, user_id, "welcome", "Joined LevelUp!", "Started your journey to building better habits.")
+    seed_user_challenges(conn, user_id)
+    return get_user_by_id(conn, user_id)
+
+
+def get_user_by_id(conn, user_id: int) -> Optional[dict]:
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    if not user:
+        return None
+    user_dict = dict(user)
+
+    cursor.execute("SELECT COUNT(*) as cnt FROM habits WHERE user_id = ? AND is_archived = 0", (user_id,))
+    user_dict["total_habits"] = cursor.fetchone()["cnt"]
+
+    today_str = date.today().isoformat()
+    cursor.execute("""
+        SELECT COUNT(*) as cnt FROM habit_logs
+        WHERE user_id = ? AND log_date = ? AND status = 'completed'
+    """, (user_id, today_str))
+    user_dict["completed_today"] = cursor.fetchone()["cnt"]
+
+    cursor.execute("SELECT COUNT(*) as cnt FROM habit_logs WHERE user_id = ? AND status = 'completed'", (user_id,))
+    user_dict["total_completions"] = cursor.fetchone()["cnt"]
+
+    cursor.execute("SELECT COUNT(*) as cnt FROM habit_logs WHERE user_id = ?", (user_id,))
+    total_logs = cursor.fetchone()["cnt"]
+    user_dict["overall_completion_rate"] = round((user_dict["total_completions"] / total_logs * 100), 1) if total_logs > 0 else 0.0
+
+    return user_dict
+
+
+def get_user_by_username_or_email(conn, identifier: str) -> Optional[dict]:
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE username = ? OR email = ?", (identifier, identifier))
+    user = cursor.fetchone()
+    return dict(user) if user else None
+
+
+def update_user_profile(conn, user_id: int, bio: Optional[str] = None, avatar_url: Optional[str] = None, theme_preference: Optional[str] = None) -> dict:
+    cursor = conn.cursor()
+    fields = []
+    values = []
+    if bio is not None:
+        fields.append("bio = ?")
+        values.append(bio)
+    if avatar_url is not None:
+        fields.append("avatar_url = ?")
+        values.append(avatar_url)
+    if theme_preference is not None:
+        fields.append("theme_preference = ?")
+        values.append(theme_preference)
+
+    if fields:
+        values.append(user_id)
+        query = f"UPDATE users SET {', '.join(fields)} WHERE id = ?"
+        cursor.execute(query, tuple(values))
+
+    return get_user_by_id(conn, user_id)
