@@ -3,6 +3,10 @@ from datetime import date, timedelta
 import math
 from typing import List, Dict, Any, Optional
 
+# ==========================================
+# 1. GAMIFICATION ENGINE & HELPERS
+# ==========================================
+
 def calculate_level(xp: int) -> int:
     """Calculates user level based on total XP: Level = floor(sqrt(XP / 25)) + 1"""
     return int(math.floor(math.sqrt(xp / 25.0))) + 1
@@ -137,6 +141,11 @@ def update_user_streaks(conn, user_id: int):
 
     cursor.execute("UPDATE users SET current_streak = ?, longest_streak = ? WHERE id = ?", (current_streak, longest_streak, user_id))
 
+
+# ==========================================
+# 2. USER OPERATIONS
+# ==========================================
+
 def create_user(conn, username: str, email: str, hashed_password: str, bio: str = "", avatar_url: str = "avatar-1") -> dict:
     cursor = conn.cursor()
     cursor.execute("""
@@ -204,6 +213,12 @@ def update_user_profile(conn, user_id: int, bio: Optional[str] = None, avatar_ur
         cursor.execute(query, tuple(values))
 
     return get_user_by_id(conn, user_id)
+
+
+# ==========================================
+# 3. HABIT OPERATIONS
+# ==========================================
+
 def create_habit(conn, user_id: int, habit_data: dict) -> dict:
     cursor = conn.cursor()
     cursor.execute("""
@@ -322,6 +337,11 @@ def delete_habit(conn, habit_id: int, user_id: int) -> bool:
     cursor.execute("DELETE FROM habits WHERE id = ? AND user_id = ?", (habit_id, user_id))
     return cursor.rowcount > 0
 
+
+# ==========================================
+# 4. TRACKING OPERATIONS
+# ==========================================
+
 def log_habit_checkin(conn, user_id: int, habit_id: int, log_date: str, status: str, reason: str = "") -> dict:
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM habits WHERE id = ? AND user_id = ?", (habit_id, user_id))
@@ -371,3 +391,387 @@ def log_habit_checkin(conn, user_id: int, habit_id: int, log_date: str, status: 
         "current_streak": u_info["current_streak"],
         "message": f"Habit marked as {status}!"
     }
+
+
+# ==========================================
+# 5. SOCIAL OPERATIONS
+# ==========================================
+
+def search_users(conn, current_user_id: int, query: str) -> List[dict]:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, username, bio, avatar_url, level, xp FROM users
+        WHERE username LIKE ? AND id != ? LIMIT 20
+    """, (f"%{query}%", current_user_id))
+    users = [dict(row) for row in cursor.fetchall()]
+
+    for u in users:
+        u_id = u["id"]
+        cursor.execute("""
+            SELECT id FROM friendships
+            WHERE (user_id_1 = ? AND user_id_2 = ?) OR (user_id_1 = ? AND user_id_2 = ?)
+        """, (current_user_id, u_id, u_id, current_user_id))
+        if cursor.fetchone():
+            u["friendship_status"] = "friends"
+            continue
+
+        cursor.execute("""
+            SELECT status, sender_id FROM friend_requests
+            WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
+        """, (current_user_id, u_id, u_id, current_user_id))
+        req = cursor.fetchone()
+        if req:
+            if req["sender_id"] == current_user_id:
+                u["friendship_status"] = "pending_sent"
+            else:
+                u["friendship_status"] = "pending_received"
+        else:
+            u["friendship_status"] = "none"
+
+    return users
+
+
+def send_friend_request(conn, sender_id: int, receiver_id: int) -> dict:
+    if sender_id == receiver_id:
+        return {"success": False, "message": "Cannot send friend request to yourself"}
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO friend_requests (sender_id, receiver_id, status)
+        VALUES (?, ?, 'pending')
+        ON CONFLICT(sender_id, receiver_id) DO UPDATE SET status = 'pending'
+    """, (sender_id, receiver_id))
+    return {"success": True, "message": "Friend request sent"}
+
+
+def respond_friend_request(conn, user_id: int, request_id: int, action: str) -> dict:
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM friend_requests WHERE id = ? AND receiver_id = ?", (request_id, user_id))
+    req = cursor.fetchone()
+    if not req:
+        return {"success": False, "message": "Request not found"}
+
+    sender_id = req["sender_id"]
+    if action == "accept":
+        cursor.execute("UPDATE friend_requests SET status = 'accepted' WHERE id = ?", (request_id,))
+        u1, u2 = min(sender_id, user_id), max(sender_id, user_id)
+        cursor.execute("INSERT OR IGNORE INTO friendships (user_id_1, user_id_2) VALUES (?, ?)", (u1, u2))
+
+        log_activity(conn, user_id, "social", "New Friend Added!", "You are now connected.")
+        log_activity(conn, sender_id, "social", "New Friend Added!", "Friend request was accepted.")
+
+        check_and_unlock_achievements(conn, user_id)
+        check_and_unlock_achievements(conn, sender_id)
+        return {"success": True, "message": "Friend request accepted"}
+    else:
+        cursor.execute("DELETE FROM friend_requests WHERE id = ?", (request_id,))
+        return {"success": True, "message": "Friend request rejected"}
+
+
+def get_friends_list(conn, user_id: int) -> List[dict]:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT u.id, u.username, u.bio, u.avatar_url, u.level, u.xp, u.current_streak, u.longest_streak
+        FROM users u
+        JOIN friendships f ON (f.user_id_1 = u.id OR f.user_id_2 = u.id)
+        WHERE (f.user_id_1 = ? OR f.user_id_2 = ?) AND u.id != ?
+    """, (user_id, user_id, user_id))
+    friends = [dict(row) for row in cursor.fetchall()]
+
+    for f in friends:
+        cursor.execute("SELECT COUNT(*) as cnt FROM habits WHERE user_id = ? AND is_archived = 0", (f["id"],))
+        f["active_habits_count"] = cursor.fetchone()["cnt"]
+
+    return friends
+
+
+def get_pending_friend_requests(conn, user_id: int) -> List[dict]:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT fr.id, fr.sender_id, fr.created_at, u.username as sender_username, u.avatar_url as sender_avatar, u.level as sender_level
+        FROM friend_requests fr
+        JOIN users u ON u.id = fr.sender_id
+        WHERE fr.receiver_id = ? AND fr.status = 'pending'
+    """, (user_id,))
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def get_friend_profile(conn, current_user_id: int, friend_id: int) -> Optional[dict]:
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, username, bio, avatar_url, level, xp, current_streak, longest_streak FROM users WHERE id = ?", (friend_id,))
+    friend = cursor.fetchone()
+    if not friend:
+        return None
+
+    f_dict = dict(friend)
+    cursor.execute("SELECT COUNT(*) as cnt FROM habits WHERE user_id = ? AND is_archived = 0", (friend_id,))
+    f_dict["active_habits_count"] = cursor.fetchone()["cnt"]
+
+    cursor.execute("SELECT COUNT(*) as cnt FROM habit_logs WHERE user_id = ? AND status = 'completed'", (friend_id,))
+    f_dict["total_completions"] = cursor.fetchone()["cnt"]
+    f_dict["friendship_status"] = "friends"
+    return f_dict
+
+
+# ==========================================
+# 6. LEADERBOARD OPERATIONS
+# ==========================================
+
+def get_leaderboard(conn, current_user_id: int, timeframe: str = "all_time", metric: str = "xp", filter_friends: bool = False) -> List[dict]:
+    cursor = conn.cursor()
+    user_ids = []
+    if filter_friends:
+        friends = get_friends_list(conn, current_user_id)
+        user_ids = [f["id"] for f in friends]
+        user_ids.append(current_user_id)
+
+    if metric == "xp":
+        query = "SELECT id, username, avatar_url, level, xp as score_value FROM users"
+        if user_ids:
+            query += f" WHERE id IN ({','.join(str(i) for i in user_ids)})"
+        query += " ORDER BY xp DESC LIMIT 50"
+        cursor.execute(query)
+        rows = cursor.fetchall()
+    elif metric == "streak":
+        query = "SELECT id, username, avatar_url, level, current_streak as score_value FROM users"
+        if user_ids:
+            query += f" WHERE id IN ({','.join(str(i) for i in user_ids)})"
+        query += " ORDER BY current_streak DESC, xp DESC LIMIT 50"
+        cursor.execute(query)
+        rows = cursor.fetchall()
+    elif metric == "completion_rate":
+        date_limit = None
+        today = date.today()
+        if timeframe == "weekly":
+            date_limit = (today - timedelta(days=7)).isoformat()
+        elif timeframe == "monthly":
+            date_limit = (today - timedelta(days=30)).isoformat()
+
+        sql = """
+            SELECT u.id, u.username, u.avatar_url, u.level,
+                   COUNT(CASE WHEN hl.status = 'completed' THEN 1 END) as completed_cnt,
+                   COUNT(hl.id) as total_cnt
+            FROM users u
+            LEFT JOIN habit_logs hl ON hl.user_id = u.id
+        """
+        conditions = []
+        if date_limit:
+            conditions.append(f"hl.log_date >= '{date_limit}'")
+        if user_ids:
+            conditions.append(f"u.id IN ({','.join(str(i) for i in user_ids)})")
+
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+
+        sql += " GROUP BY u.id ORDER BY (CASE WHEN COUNT(hl.id) > 0 THEN (COUNT(CASE WHEN hl.status = 'completed' THEN 1 END) * 100.0 / COUNT(hl.id)) ELSE 0 END) DESC LIMIT 50"
+        cursor.execute(sql)
+        raw_rows = cursor.fetchall()
+
+        results = []
+        for rank, r in enumerate(raw_rows, start=1):
+            tot = r["total_cnt"]
+            rate = round((r["completed_cnt"] / tot * 100), 1) if tot > 0 else 0.0
+            results.append({
+                "rank": rank,
+                "user_id": r["id"],
+                "username": r["username"],
+                "avatar_url": r["avatar_url"],
+                "level": r["level"],
+                "score_value": f"{rate}%",
+                "metric_label": "Completion Rate",
+                "is_current_user": (r["id"] == current_user_id)
+            })
+        return results
+
+    results = []
+    metric_map = {"xp": "XP", "streak": "Days"}
+    for rank, r in enumerate(rows, start=1):
+        results.append({
+            "rank": rank,
+            "user_id": r["id"],
+            "username": r["username"],
+            "avatar_url": r["avatar_url"],
+            "level": r["level"],
+            "score_value": f"{r['score_value']} {metric_map.get(metric, '')}",
+            "metric_label": metric.upper(),
+            "is_current_user": (r["id"] == current_user_id)
+        })
+
+    return results
+
+
+# ==========================================
+# 7. GAMIFICATION & CHALLENGES OPERATIONS
+# ==========================================
+
+def seed_user_challenges(conn, user_id: int):
+    cursor = conn.cursor()
+    today_str = date.today().isoformat()
+    cursor.execute("SELECT id FROM challenges")
+    challenges = cursor.fetchall()
+    for ch in challenges:
+        cursor.execute("""
+            INSERT OR IGNORE INTO user_challenges (user_id, challenge_id, progress, completed, assigned_date)
+            VALUES (?, ?, 0, 0, ?)
+        """, (user_id, ch["id"], today_str))
+
+
+def update_challenge_progress(conn, user_id: int, status: str):
+    if status != "completed":
+        return
+    cursor = conn.cursor()
+    today_str = date.today().isoformat()
+    cursor.execute("""
+        SELECT uc.id, uc.progress, uc.completed, c.target_count, c.xp_reward, c.title
+        FROM user_challenges uc
+        JOIN challenges c ON c.id = uc.challenge_id
+        WHERE uc.user_id = ? AND uc.assigned_date = ? AND uc.completed = 0
+    """, (user_id, today_str))
+    user_challenges = cursor.fetchall()
+
+    for uc in user_challenges:
+        new_prog = uc["progress"] + 1
+        is_completed = new_prog >= uc["target_count"]
+        cursor.execute("UPDATE user_challenges SET progress = ?, completed = ? WHERE id = ?", (new_prog, is_completed, uc["id"]))
+        if is_completed:
+            award_xp(conn, user_id, uc["xp_reward"], f"Challenge: {uc['title']}")
+            log_activity(conn, user_id, "challenge_completed", f"Challenge Completed: {uc['title']}", f"+{uc['xp_reward']} XP Reward")
+
+
+def get_user_achievements(conn, user_id: int) -> List[dict]:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT a.*, CASE WHEN ua.id IS NOT NULL THEN 1 ELSE 0 END as unlocked, ua.unlocked_at
+        FROM achievements a
+        LEFT JOIN user_achievements ua ON ua.achievement_id = a.id AND ua.user_id = ?
+        ORDER BY a.id ASC
+    """, (user_id,))
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def get_user_challenges(conn, user_id: int) -> List[dict]:
+    seed_user_challenges(conn, user_id)
+    cursor = conn.cursor()
+    today_str = date.today().isoformat()
+    cursor.execute("""
+        SELECT c.id, c.title, c.description, c.type, c.target_count, c.xp_reward, c.icon, uc.progress, uc.completed
+        FROM user_challenges uc
+        JOIN challenges c ON c.id = uc.challenge_id
+        WHERE uc.user_id = ? AND uc.assigned_date = ?
+    """, (user_id, today_str))
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def get_recent_activity(conn, user_id: int, limit: int = 10) -> List[dict]:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM activity_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?
+    """, (user_id, limit))
+    return [dict(row) for row in cursor.fetchall()]
+
+
+# ==========================================
+# 8. ANALYTICS OPERATIONS
+# ==========================================
+
+def get_analytics_summary(conn, user_id: int) -> dict:
+    user = get_user_by_id(conn, user_id)
+    today_str = date.today().isoformat()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) as cnt FROM habits WHERE user_id = ? AND is_archived = 0", (user_id,))
+    total_habits = cursor.fetchone()["cnt"]
+
+    cursor.execute("SELECT COUNT(*) as cnt FROM habit_logs WHERE user_id = ? AND log_date = ? AND status = 'completed'", (user_id, today_str))
+    completed_today = cursor.fetchone()["cnt"]
+
+    today_rate = round((completed_today / total_habits * 100), 1) if total_habits > 0 else 0.0
+
+    cursor.execute("SELECT COUNT(*) as cnt FROM habit_logs WHERE user_id = ? AND status = 'completed'", (user_id,))
+    total_checkins = cursor.fetchone()["cnt"]
+
+    return {
+        "total_habits": total_habits,
+        "completed_today": completed_today,
+        "today_completion_rate": today_rate,
+        "current_streak": user["current_streak"],
+        "longest_streak": user["longest_streak"],
+        "total_checkins": total_checkins,
+        "total_xp": user["xp"],
+        "level": user["level"]
+    }
+
+
+def get_weekly_analytics(conn, user_id: int) -> dict:
+    cursor = conn.cursor()
+    today = date.today()
+    day_names = []
+    completions_by_day = []
+
+    for i in range(6, -1, -1):
+        d = today - timedelta(days=i)
+        d_str = d.isoformat()
+        day_names.append(d.strftime("%a"))
+        cursor.execute("SELECT COUNT(*) as cnt FROM habit_logs WHERE user_id = ? AND log_date = ? AND status = 'completed'", (user_id, d_str))
+        cnt = cursor.fetchone()["cnt"]
+        completions_by_day.append(cnt)
+
+    return {
+        "day_names": day_names,
+        "completions_by_day": completions_by_day
+    }
+
+
+def get_category_breakdown(conn, user_id: int) -> List[dict]:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT category, COUNT(*) as habit_count FROM habits
+        WHERE user_id = ? AND is_archived = 0 GROUP BY category
+    """, (user_id,))
+    cats = cursor.fetchall()
+
+    result = []
+    for c in cats:
+        cat_name = c["category"]
+        cursor.execute("""
+            SELECT COUNT(hl.id) as completion_count FROM habit_logs hl
+            JOIN habits h ON h.id = hl.habit_id
+            WHERE hl.user_id = ? AND h.category = ? AND hl.status = 'completed'
+        """, (user_id, cat_name))
+        comp = cursor.fetchone()["completion_count"]
+        result.append({
+            "category": cat_name,
+            "habit_count": c["habit_count"],
+            "completion_count": comp
+        })
+
+    return result
+
+
+def get_habit_heatmap(conn, user_id: int, days: int = 60) -> List[dict]:
+    cursor = conn.cursor()
+    today = date.today()
+    heatmap = []
+
+    for i in range(days - 1, -1, -1):
+        d = today - timedelta(days=i)
+        d_str = d.isoformat()
+        cursor.execute("SELECT COUNT(*) as cnt FROM habit_logs WHERE user_id = ? AND log_date = ? AND status = 'completed'", (user_id, d_str))
+        cnt = cursor.fetchone()["cnt"]
+
+        lvl = 0
+        if cnt >= 7:
+            lvl = 4
+        elif cnt >= 5:
+            lvl = 3
+        elif cnt >= 3:
+            lvl = 2
+        elif cnt >= 1:
+            lvl = 1
+
+        heatmap.append({
+            "date": d_str,
+            "count": cnt,
+            "level": lvl
+        })
+
+    return heatmap
