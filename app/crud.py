@@ -204,3 +204,120 @@ def update_user_profile(conn, user_id: int, bio: Optional[str] = None, avatar_ur
         cursor.execute(query, tuple(values))
 
     return get_user_by_id(conn, user_id)
+def create_habit(conn, user_id: int, habit_data: dict) -> dict:
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO habits (user_id, title, description, frequency, category, color, icon, priority, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        habit_data.get("title"),
+        habit_data.get("description", ""),
+        habit_data.get("frequency", "daily"),
+        habit_data.get("category", "General"),
+        habit_data.get("color", "#4f46e5"),
+        habit_data.get("icon", "bi-check-circle"),
+        habit_data.get("priority", "medium"),
+        habit_data.get("notes", "")
+    ))
+    habit_id = cursor.lastrowid
+    log_activity(conn, user_id, "habit_created", f"Created new habit: {habit_data.get('title')}")
+    check_and_unlock_achievements(conn, user_id)
+    return get_habit_by_id(conn, habit_id, user_id)
+
+
+def get_habits_by_user(conn, user_id: int, category: Optional[str] = None, include_archived: bool = False) -> List[dict]:
+    cursor = conn.cursor()
+    query = "SELECT * FROM habits WHERE user_id = ?"
+    params = [user_id]
+
+    if not include_archived:
+        query += " AND is_archived = 0"
+    if category and category != "All":
+        query += " AND category = ?"
+        params.append(category)
+
+    query += " ORDER BY id DESC"
+    cursor.execute(query, tuple(params))
+    habits = [dict(row) for row in cursor.fetchall()]
+
+    today_str = date.today().isoformat()
+    for h in habits:
+        h_id = h["id"]
+        cursor.execute("SELECT status, reason FROM habit_logs WHERE habit_id = ? AND log_date = ?", (h_id, today_str))
+        log = cursor.fetchone()
+        if log:
+            h["is_completed_today"] = (log["status"] == "completed")
+            h["today_status"] = log["status"]
+            h["missed_reason"] = log["reason"]
+        else:
+            h["is_completed_today"] = False
+            h["today_status"] = None
+            h["missed_reason"] = None
+
+        cursor.execute("SELECT log_date FROM habit_logs WHERE habit_id = ? AND status = 'completed' ORDER BY log_date DESC", (h_id,))
+        logs = cursor.fetchall()
+        if not logs:
+            h["current_streak"] = 0
+            h["longest_streak"] = 0
+            h["total_completions"] = 0
+            h["completion_rate"] = 0.0
+        else:
+            h["total_completions"] = len(logs)
+            log_dates = [datetime.datetime.strptime(l["log_date"], "%Y-%m-%d").date() for l in logs]
+            cur_streak = 0
+            check_d = date.today()
+            date_set = set(log_dates)
+            if check_d not in date_set and (check_d - timedelta(days=1)) in date_set:
+                check_d = check_d - timedelta(days=1)
+            while check_d in date_set:
+                cur_streak += 1
+                check_d -= timedelta(days=1)
+            h["current_streak"] = cur_streak
+            h["longest_streak"] = cur_streak
+
+            cursor.execute("SELECT COUNT(*) as total FROM habit_logs WHERE habit_id = ?", (h_id,))
+            tot = cursor.fetchone()["total"]
+            h["completion_rate"] = round((h["total_completions"] / tot * 100), 1) if tot > 0 else 0.0
+
+    return habits
+
+
+def get_habit_by_id(conn, habit_id: int, user_id: int) -> Optional[dict]:
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM habits WHERE id = ? AND user_id = ?", (habit_id, user_id))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    h = dict(row)
+    today_str = date.today().isoformat()
+    cursor.execute("SELECT status, reason FROM habit_logs WHERE habit_id = ? AND log_date = ?", (habit_id, today_str))
+    log = cursor.fetchone()
+    h["is_completed_today"] = (log["status"] == "completed") if log else False
+    h["today_status"] = log["status"] if log else None
+    h["missed_reason"] = log["reason"] if log else None
+    return h
+
+
+def update_habit(conn, habit_id: int, user_id: int, update_data: dict) -> Optional[dict]:
+    cursor = conn.cursor()
+    fields = []
+    values = []
+    for k, v in update_data.items():
+        if v is not None:
+            fields.append(f"{k} = ?")
+            values.append(v)
+
+    if not fields:
+        return get_habit_by_id(conn, habit_id, user_id)
+
+    values.extend([habit_id, user_id])
+    query = f"UPDATE habits SET {', '.join(fields)} WHERE id = ? AND user_id = ?"
+    cursor.execute(query, tuple(values))
+    return get_habit_by_id(conn, habit_id, user_id)
+
+
+def delete_habit(conn, habit_id: int, user_id: int) -> bool:
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM habits WHERE id = ? AND user_id = ?", (habit_id, user_id))
+    return cursor.rowcount > 0
