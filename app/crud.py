@@ -321,3 +321,53 @@ def delete_habit(conn, habit_id: int, user_id: int) -> bool:
     cursor = conn.cursor()
     cursor.execute("DELETE FROM habits WHERE id = ? AND user_id = ?", (habit_id, user_id))
     return cursor.rowcount > 0
+
+def log_habit_checkin(conn, user_id: int, habit_id: int, log_date: str, status: str, reason: str = "") -> dict:
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM habits WHERE id = ? AND user_id = ?", (habit_id, user_id))
+    habit = cursor.fetchone()
+    if not habit:
+        return {"success": False, "message": "Habit not found or unauthorized"}
+
+    if not log_date:
+        log_date = date.today().isoformat()
+
+    xp_earned = 0
+    if status == "completed":
+        xp_earned = 15  # 15 XP base reward
+        cursor.execute("SELECT current_streak FROM users WHERE id = ?", (user_id,))
+        streak = cursor.fetchone()["current_streak"]
+        if streak >= 3:
+            xp_earned += 10  # 10 XP streak bonus
+
+    cursor.execute("""
+        INSERT INTO habit_logs (habit_id, user_id, log_date, status, reason, xp_earned)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(habit_id, log_date) DO UPDATE SET
+            status = excluded.status,
+            reason = excluded.reason,
+            xp_earned = excluded.xp_earned
+    """, (habit_id, user_id, log_date, status, reason, xp_earned))
+
+    xp_res = {"new_xp": 0, "new_level": 1, "level_up": False}
+    if xp_earned > 0:
+        xp_res = award_xp(conn, user_id, xp_earned, f"Habit: {habit['title']}")
+        log_activity(conn, user_id, "habit_completed", f"Completed: {habit['title']}", f"+{xp_earned} XP earned")
+
+    update_user_streaks(conn, user_id)
+    update_challenge_progress(conn, user_id, status)
+    check_and_unlock_achievements(conn, user_id)
+
+    cursor.execute("SELECT current_streak, xp, level FROM users WHERE id = ?", (user_id,))
+    u_info = cursor.fetchone()
+
+    return {
+        "success": True,
+        "status": status,
+        "xp_earned": xp_earned,
+        "new_xp": u_info["xp"],
+        "new_level": u_info["level"],
+        "level_up": xp_res["level_up"],
+        "current_streak": u_info["current_streak"],
+        "message": f"Habit marked as {status}!"
+    }
