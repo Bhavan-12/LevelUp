@@ -29,3 +29,22 @@ def seed_initial_data():
                     xp_reward = excluded.xp_reward,
                     category = excluded.category
             """, ach)
+
+        challenges = [
+            ("Daily Hat-Trick", "Complete 3 habits today to earn bonus XP.", "daily", 3, 50, "bi-check2-all"),
+            ("Consistency First", "Complete at least 1 habit today.", "daily", 1, 25, "bi-calendar-check"),
+            ("Weekly Powerhouse", "Complete 15 habit check-ins this week.", "weekly", 15, 150, "bi-activity")
+        ]
+        
+        for ch in challenges:
+            cursor.execute("""
+                INSERT INTO challenges (title, description, type, target_count, xp_reward, icon)
+                SELECT ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (SELECT 1 FROM challenges WHERE title = ?)
+            """, (*ch, ch[0]))
+            
+        conn.commit()
+
+if __name__ == "__main__":
+    seed_initial_data()
+    print("Seed data loaded successfully!")
